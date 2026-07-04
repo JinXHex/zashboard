@@ -1,0 +1,60 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 每 3 天运行一次（UTC 时间 19:00 = 北京时间凌晨 3:00）
+    - cron: '0 19 */3 * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add Upstream
+        run: |
+          git remote add upstream https://github.com/Zephyruso/zashboard.git
+          git fetch upstream
+
+      - name: Check if upstream has real code
+        id: check
+        run: |
+          # 检查上游 main 分支是否有 index.html 或 src 目录
+          # 如果这两个都不存在，说明上游已归档或清空
+          HAS_INDEX=$(git ls-tree upstream/main --name-only | grep -c "^index.html" || true)
+          HAS_SRC=$(git ls-tree -r upstream/main --name-only | grep -c "^src/" || true)
+          HAS_PACKAGE=$(git ls-tree upstream/main --name-only | grep -c "^package.json" || true)
+          
+          echo "index.html: $HAS_INDEX"
+          echo "src/ files: $HAS_SRC"
+          echo "package.json: $HAS_PACKAGE"
+          
+          if [ "$HAS_INDEX" = "0" ] && [ "$HAS_SRC" = "0" ] && [ "$HAS_PACKAGE" = "0" ]; then
+            echo "upstream_alive=false" >> $GITHUB_OUTPUT
+            echo "::warning::上游仓库似乎已归档或清空，跳过本次同步"
+          else
+            echo "upstream_alive=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Merge Upstream
+        if: steps.check.outputs.upstream_alive == 'true'
+        run: |
+          git merge upstream/main --no-edit
+          git push origin main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip Sync
+        if: steps.check.outputs.upstream_alive == 'false'
+        run: |
+          echo "上游仓库已归档或清空，保留当前代码不变，跳过同步。"
