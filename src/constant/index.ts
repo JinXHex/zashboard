@@ -146,6 +146,7 @@ export enum LOG_LEVEL {
   Error = 'error',
   Fatal = 'fatal',
   Panic = 'panic',
+  Silent = 'silent',
 }
 
 export enum ROUTE_NAME {
@@ -194,9 +195,13 @@ export enum PROXY_TYPE {
   Direct = 'direct',
   Reject = 'reject',
   RejectDrop = 'rejectdrop',
+  Block = 'block',
   Compatible = 'compatible',
   Pass = 'pass',
+  PassRule = 'passrule',
+  Rematch = 'rematch',
   Dns = 'dns',
+  Relay = 'relay',
   Selector = 'selector',
   Fallback = 'fallback',
   URLTest = 'urltest',
