@@ -2,59 +2,161 @@ name: Sync Upstream
 
 on:
   schedule:
-    # 每 3 天运行一次（UTC 时间 19:00 = 北京时间凌晨 3:00）
+    # 每 3 天运行一次（UTC 19:00，北京时间次日凌晨 3:00）
     - cron: '0 19 */3 * *'
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch:
+
+# 允许推送代码和标签
+permissions:
+  contents: write
+
+# 防止定时任务和手动任务同时运行
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
+      # 1. Checkout 本地仓库
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+          fetch-tags: true
 
+      # 2. 配置 Git
       - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add Upstream
+      # 3. 获取上游代码
+      - name: Fetch Upstream
         run: |
           git remote add upstream https://github.com/Zephyruso/zashboard.git
-          git fetch upstream
+          git fetch upstream main
 
-      - name: Check if upstream has real code
+          # 获取上一次成功同步时保存的版本标签
+          git fetch origin refs/tags/upstream-sync-base:refs/tags/upstream-sync-base || true
+
+      # 4. 检查上游仓库是否正常
+      - name: Check Upstream Health
         id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 检查上游 main 分支是否有 index.html 或 src 目录
-          # 如果这两个都不存在，说明上游已归档或清空
-          HAS_INDEX=$(git ls-tree upstream/main --name-only | grep -c "^index.html" || true)
-          HAS_SRC=$(git ls-tree -r upstream/main --name-only | grep -c "^src/" || true)
-          HAS_PACKAGE=$(git ls-tree upstream/main --name-only | grep -c "^package.json" || true)
-          
-          echo "index.html: $HAS_INDEX"
-          echo "src/ files: $HAS_SRC"
-          echo "package.json: $HAS_PACKAGE"
-          
-          if [ "$HAS_INDEX" = "0" ] && [ "$HAS_SRC" = "0" ] && [ "$HAS_PACKAGE" = "0" ]; then
-            echo "upstream_alive=false" >> $GITHUB_OUTPUT
-            echo "::warning::上游仓库似乎已归档或清空，跳过本次同步"
-          else
-            echo "upstream_alive=true" >> $GITHUB_OUTPUT
+          set -e
+
+          echo "========== 检查上游仓库状态 =========="
+
+          # 检查仓库是否被归档
+          ARCHIVED=$(gh api repos/Zephyruso/zashboard --jq '.archived')
+
+          if [ "$ARCHIVED" = "true" ]; then
+            echo "::error::上游仓库已经归档，停止同步"
+            echo "upstream_alive=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          # 检查核心文件
+          HAS_INDEX=$(git ls-tree upstream/main --name-only | grep -cx 'index.html' || true)
+          HAS_PACKAGE=$(git ls-tree upstream/main --name-only | grep -cx 'package.json' || true)
+          HAS_SRC=$(git ls-tree -r upstream/main --name-only | grep -c '^src/' || true)
+
+          echo "index.html: $HAS_INDEX"
+          echo "package.json: $HAS_PACKAGE"
+          echo "src files: $HAS_SRC"
+
+          if [ "$HAS_INDEX" -eq 0 ] || \
+             [ "$HAS_PACKAGE" -eq 0 ] || \
+             [ "$HAS_SRC" -lt 50 ]; then
+
+            echo "::error::上游核心代码缺失或异常减少，停止同步"
+            echo "upstream_alive=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 统计代码文件数量
+          CURRENT_COUNT=$(git ls-tree -r --name-only upstream/main | \
+            grep -Ec '\.(vue|ts|tsx|js|jsx|css|html|json)$' || true)
+
+          echo "当前上游代码文件数量: $CURRENT_COUNT"
+
+          # 与上一次成功同步的版本进行比较
+          if git rev-parse -q --verify refs/tags/upstream-sync-base >/dev/null; then
+
+            PREVIOUS_COUNT=$(git ls-tree -r --name-only upstream-sync-base | \
+              grep -Ec '\.(vue|ts|tsx|js|jsx|css|html|json)$' || true)
+
+            echo "上次同步代码文件数量: $PREVIOUS_COUNT"
+
+            if [ "$PREVIOUS_COUNT" -gt 0 ]; then
+              DROP_LIMIT=$((PREVIOUS_COUNT * 50 / 100))
+
+              if [ "$CURRENT_COUNT" -lt "$DROP_LIMIT" ]; then
+                echo "::error::上游代码文件数量下降超过 50%，疑似异常清空"
+                echo "upstream_alive=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+
+          else
+            # 首次运行没有历史基准，采用最低文件数量保护
+            if [ "$CURRENT_COUNT" -lt 100 ]; then
+              echo "::error::首次检查发现上游代码规模异常"
+              echo "upstream_alive=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "上游检查通过，可以同步"
+          echo "upstream_alive=true" >> "$GITHUB_OUTPUT"
+
+      # 5. 同步上游代码
       - name: Merge Upstream
         if: steps.check.outputs.upstream_alive == 'true'
         run: |
-          git merge upstream/main --no-edit
-          git push origin main
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          set -e
 
+          echo "========== 开始同步上游 =========="
+
+          # 保存本地同步前的提交
+          LOCAL_HEAD=$(git rev-parse HEAD)
+
+          # 合并上游代码
+          # 如果普通代码发生冲突，优先采用上游版本
+          git merge -X theirs upstream/main --no-edit
+
+          # 重要：恢复本地工作流文件
+          # 防止上游的 .github/workflows 覆盖自己的工作流
+
+          if git ls-tree -d "$LOCAL_HEAD" .github/workflows | grep -q .; then
+            git checkout "$LOCAL_HEAD" -- .github/workflows/
+          fi
+
+          # 提交工作流保护产生的修改
+          git add -A .github/workflows/
+
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: preserve local GitHub workflows"
+          fi
+
+          # 推送同步结果
+          git push origin main
+
+          # 更新上次成功同步的上游版本记录
+          git tag -f upstream-sync-base upstream/main
+          git push origin refs/tags/upstream-sync-base --force
+
+          echo "========== 上游同步完成 =========="
+
+      # 6. 上游异常时跳过
       - name: Skip Sync
         if: steps.check.outputs.upstream_alive == 'false'
         run: |
-          echo "上游仓库已归档或清空，保留当前代码不变，跳过同步。"
+          echo "::warning::上游仓库异常，已停止同步"
+          echo "本地代码和工作流保持不变。"
