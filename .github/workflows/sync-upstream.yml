@@ -49,7 +49,7 @@ jobs:
       - name: Merge Upstream
         if: steps.check.outputs.upstream_alive == 'true'
         run: |
-          git merge upstream/main --no-edit
+          git merge upstream/main -X theirs --no-edit
           git push origin main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
